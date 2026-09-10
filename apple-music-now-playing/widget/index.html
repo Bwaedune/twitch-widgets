@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Apple Music Now Playing</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="card" class="card">
+    <div class="artwork">
+      <img id="artwork-img" alt="" />
+      <div class="artwork-fallback">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true">
+          <path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/>
+        </svg>
+      </div>
+    </div>
+    <div class="info">
+      <div class="title" id="title"></div>
+      <div class="artist" id="artist"></div>
+    </div>
+    <div class="eq" id="eq" aria-hidden="true">
+      <span></span><span></span><span></span>
+    </div>
+  </div>
+  <script src="widget.js"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "name": "apple-music-widget-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local relay server: receives now-playing data from the browser extension and serves the OBS widget page.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
