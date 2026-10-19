@@ -34,5 +34,5 @@ The default setup copies the behaviour shown in QuantFlow's website demo. A tren
 
 - The jobs-report rule assumes the first Friday of the month, which is usually but not always the release date. When it moves, add the actual date to the event list.
 - The ribbon lengths and flip buffer are my estimates from the demo animation. If signals come too often (whipsaw), raise **Flip buffer** or the **Main line EMA**.
-- The stats box simulates fills at the signal bar's close and at the exact stop/target prices, with no slippage or commissions. When the stop and a target fall on the same bar, it counts the stop first. Treat the numbers as a rough guide, not a guarantee.
+- The stats box simulates fills at the signal bar's close and at the exact stop/target prices. The only costs it includes are the flat round-trip points you set (default 1.12). When the stop and a target fall on the same bar, it counts the stop first. Treat the numbers as a rough guide, not a guarantee.
 - This is a technical tool, not financial advice. Forward-test it on a paper account before you risk money.
