@@ -1,0 +1,439 @@
+//@version=6
+// FlowSignal NQ — five-source BUY/SELL signal engine for NQ / MNQ futures (built for the 5-minute chart).
+// Signals are evaluated on confirmed (closed) bars only, so they never repaint.
+indicator("FlowSignal NQ", shorttitle = "FlowSignal", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+// ═════════════════════════════════════════ Inputs ═════════════════════════════════════════
+const string G_SRC  = "Signal sources"
+const string G_LEN  = "Source settings"
+const string G_SESS = "Session (exchange time zone below)"
+const string G_RISK = "Targets, stops & trade management"
+const string G_NEWS = "News filter"
+const string G_MKT  = "Market filters"
+const string G_VIS  = "Display"
+
+useTrend = input.bool(true, "1 · Trend pullback (EMA)",         group = G_SRC)
+useVwap  = input.bool(true, "2 · VWAP reclaim / rejection",     group = G_SRC)
+useOrb   = input.bool(true, "3 · Opening range breakout",       group = G_SRC)
+useSweep = input.bool(true, "4 · Liquidity sweep reversal",     group = G_SRC)
+useMom   = input.bool(true, "5 · Momentum shift (RSI + ADX)",   group = G_SRC)
+minScore = input.int(1, "Min. sources agreeing", minval = 1, maxval = 5, group = G_SRC, tooltip = "How many enabled sources must fire in the same direction on the same bar.")
+useHtf   = input.bool(true, "Require higher-timeframe bias", group = G_SRC)
+htfTf    = input.timeframe("15", "HTF timeframe", group = G_SRC)
+htfLen   = input.int(50, "HTF EMA length", minval = 1, group = G_SRC)
+cooldown = input.int(3, "Min. bars between signals", minval = 0, group = G_SRC)
+
+emaFastLen  = input.int(9,  "EMA fast",   minval = 1, group = G_LEN)
+emaSlowLen  = input.int(21, "EMA slow",   minval = 1, group = G_LEN)
+emaTrendLen = input.int(50, "EMA trend",  minval = 1, group = G_LEN)
+volLen      = input.int(20, "Volume average length (VWAP source)", minval = 1, group = G_LEN)
+orMinutes   = input.int(15, "Opening range minutes", minval = 1, group = G_LEN)
+sweepLen    = input.int(20, "Sweep lookback bars", minval = 2, group = G_LEN)
+rsiLen      = input.int(14, "RSI length", minval = 2, group = G_LEN)
+adxLen      = input.int(14, "ADX length", minval = 2, group = G_LEN)
+adxMin      = input.float(20, "Min. ADX", minval = 0, group = G_LEN)
+
+tz          = input.string("America/New_York", "Time zone", group = G_SESS)
+startH      = input.int(9,  "RTH open hour",       minval = 0, maxval = 23, inline = "s", group = G_SESS)
+startM      = input.int(30, "min",                 minval = 0, maxval = 59, inline = "s", group = G_SESS)
+lastEntryH  = input.int(15, "Last entry hour",     minval = 0, maxval = 23, inline = "l", group = G_SESS)
+lastEntryM  = input.int(30, "min",                 minval = 0, maxval = 59, inline = "l", group = G_SESS)
+flatH       = input.int(15, "Flatten hour",        minval = 0, maxval = 23, inline = "f", group = G_SESS)
+flatM       = input.int(55, "min",                 minval = 0, maxval = 59, inline = "f", group = G_SESS)
+
+atrLen        = input.int(14, "ATR length", minval = 1, group = G_RISK)
+slMode        = input.string("ATR", "Stop placement", options = ["ATR", "Swing"], group = G_RISK)
+slMult        = input.float(1.0, "ATR stop multiple", minval = 0.1, step = 0.1, group = G_RISK)
+swingLen      = input.int(5, "Swing stop lookback", minval = 1, group = G_RISK)
+maxRiskPts    = input.float(40.0, "Skip signals risking more than (points)", minval = 0.25, group = G_RISK)
+tp1R          = input.float(1.0, "TP1 (R multiple)", minval = 0.1, step = 0.1, group = G_RISK)
+tp2R          = input.float(2.0, "TP2 (R multiple)", minval = 0.1, step = 0.1, group = G_RISK)
+tp3R          = input.float(3.0, "TP3 (R multiple)", minval = 0.1, step = 0.1, group = G_RISK)
+beAfterTp1    = input.bool(true, "Move stop to breakeven after TP1", group = G_RISK)
+trailAfterTp2 = input.bool(true, "Move stop to TP1 after TP2", group = G_RISK)
+reverseOnOpp  = input.bool(true, "Reverse on opposite signal", group = G_RISK)
+
+newsOn     = input.bool(true, "Pause around news", group = G_NEWS)
+autoNfp    = input.bool(true, "Auto: jobs report (first Friday, 08:30)", group = G_NEWS)
+newsBefore = input.int(5,  "Minutes before event", minval = 0, group = G_NEWS)
+newsAfter  = input.int(15, "Minutes after event",  minval = 0, group = G_NEWS)
+eventList  = input.text_area("", "Event times (CPI, FOMC, ...)", group = G_NEWS, tooltip = "One per line or comma-separated, in the time zone above.\nFormat: YYYY-MM-DD HH:MM\nExample:\n2026-11-12 08:30\n2026-12-09 14:00")
+
+vixOn       = input.bool(true, "Pause on VIX spike", group = G_MKT)
+vixSym      = input.symbol("CBOE:VIX", "VIX symbol", group = G_MKT)
+vixLook     = input.int(6, "VIX lookback bars", minval = 1, group = G_MKT)
+vixSpikePct = input.float(8.0, "VIX rise to pause (%)", minval = 0.1, group = G_MKT)
+vixMax      = input.float(30.0, "VIX level to pause", minval = 1, group = G_MKT)
+yldOn       = input.bool(true, "Block BUYs when 10Y yield jumps", group = G_MKT)
+yldSym      = input.symbol("TVC:US10Y", "10Y yield symbol", group = G_MKT)
+yldLook     = input.int(12, "Yield lookback bars", minval = 1, group = G_MKT)
+yldJumpBp   = input.float(5.0, "Yield jump to block BUYs (bp)", minval = 0.1, group = G_MKT)
+volOn       = input.bool(true, "Pause on extreme volatility", group = G_MKT)
+volRatioMax = input.float(2.5, "ATR / 100-bar avg ATR to pause", minval = 1.0, step = 0.1, group = G_MKT)
+
+showLevels  = input.bool(true, "Entry / stop / target lines", group = G_VIS)
+showEmas    = input.bool(true, "EMAs", group = G_VIS)
+showVwap    = input.bool(true, "VWAP", group = G_VIS)
+showOr      = input.bool(true, "Opening range", group = G_VIS)
+showBlocked = input.bool(true, "Mark signals blocked by filters", group = G_VIS)
+showPanel   = input.bool(true, "Filter panel", group = G_VIS)
+showStats   = input.bool(true, "Stats box", group = G_VIS)
+
+const color C_BUY  = #00c853
+const color C_SELL = #ff1744
+const color C_TP   = #2979ff
+const color C_BG   = #131722
+const color C_TXT  = #d1d4dc
+const color C_DIM  = #787b86
+
+// ═════════════════════════════════════════ Session clock ═════════════════════════════════════════
+int y  = year(time, tz)
+int mo = month(time, tz)
+int d  = dayofmonth(time, tz)
+int startTs     = timestamp(tz, y, mo, d, startH, startM)
+int orEndTs     = startTs + orMinutes * 60000
+int lastEntryTs = timestamp(tz, y, mo, d, lastEntryH, lastEntryM)
+int flatTs      = timestamp(tz, y, mo, d, flatH, flatM)
+bool canEnter   = time >= startTs and time < lastEntryTs
+bool mustFlat   = time_close >= flatTs
+
+// ═════════════════════════════════════════ Indicators ═════════════════════════════════════════
+// Every ta.* call runs on every bar (outside conditionals) so its history stays consistent.
+float emaF = ta.ema(close, emaFastLen)
+float emaS = ta.ema(close, emaSlowLen)
+float emaT = ta.ema(close, emaTrendLen)
+float vw   = ta.vwap(hlc3)
+float atr  = ta.atr(atrLen)
+float atrBase = ta.sma(atr, 100)
+float rsi  = ta.rsi(close, rsiLen)
+[diP, diM, adx] = ta.dmi(adxLen, adxLen)
+float volAvg = ta.sma(volume, volLen)
+float recentLow  = ta.lowest(low, 3)
+float recentHigh = ta.highest(high, 3)
+float priorLow   = ta.lowest(low, sweepLen)[1]
+float priorHigh  = ta.highest(high, sweepLen)[1]
+float swingLo    = ta.lowest(low, swingLen)
+float swingHi    = ta.highest(high, swingLen)
+bool crossUpFast = ta.crossover(close, emaF)
+bool crossDnFast = ta.crossunder(close, emaF)
+bool crossUpVwap = ta.crossover(close, vw)
+bool crossDnVwap = ta.crossunder(close, vw)
+bool rsiUp       = ta.crossover(rsi, 50)
+bool rsiDn       = ta.crossunder(rsi, 50)
+
+// Higher-timeframe bias from the previous closed HTF bar (no lookahead leak).
+[htfC, htfE] = request.security(syminfo.tickerid, htfTf, [close[1], ta.ema(close, htfLen)[1]], lookahead = barmerge.lookahead_on)
+bool htfBull = not useHtf or htfC > htfE
+bool htfBear = not useHtf or htfC < htfE
+
+// ═════════════════════════════════════════ Five signal sources ═════════════════════════════════════════
+bool upTrend = emaF > emaS and emaS > emaT
+bool dnTrend = emaF < emaS and emaS < emaT
+bool trendBuy  = useTrend and upTrend and recentLow <= emaS and crossUpFast
+bool trendSell = useTrend and dnTrend and recentHigh >= emaS and crossDnFast
+
+bool volOk    = volume > volAvg
+bool vwapBuy  = useVwap and crossUpVwap and close > open and volOk
+bool vwapSell = useVwap and crossDnVwap and close < open and volOk
+
+var float orH = na
+var float orL = na
+var bool orLongDone  = false
+var bool orShortDone = false
+if time >= startTs and time[1] < startTs
+    orH := high
+    orL := low
+    orLongDone  := false
+    orShortDone := false
+else if time >= startTs and time_close <= orEndTs
+    orH := math.max(orH, high)
+    orL := math.min(orL, low)
+bool orReady = time >= orEndTs and time < flatTs and not na(orH)
+bool orbBuy  = useOrb and orReady and not orLongDone  and close > orH
+bool orbSell = useOrb and orReady and not orShortDone and close < orL
+if barstate.isconfirmed and orbBuy
+    orLongDone := true
+if barstate.isconfirmed and orbSell
+    orShortDone := true
+
+bool sweepBuy  = useSweep and low < priorLow and close > priorLow and close > open
+bool sweepSell = useSweep and high > priorHigh and close < priorHigh and close < open
+
+bool momBuy  = useMom and rsiUp and adx > adxMin and diP > diM
+bool momSell = useMom and rsiDn and adx > adxMin and diM > diP
+
+int buyScore  = (trendBuy ? 1 : 0) + (vwapBuy ? 1 : 0) + (orbBuy ? 1 : 0) + (sweepBuy ? 1 : 0) + (momBuy ? 1 : 0)
+int sellScore = (trendSell ? 1 : 0) + (vwapSell ? 1 : 0) + (orbSell ? 1 : 0) + (sweepSell ? 1 : 0) + (momSell ? 1 : 0)
+
+sourceNames(bool a, bool b, bool c, bool e, bool f) =>
+    array<string> parts = array.new<string>()
+    if a
+        parts.push("Trend")
+    if b
+        parts.push("VWAP")
+    if c
+        parts.push("ORB")
+    if e
+        parts.push("Sweep")
+    if f
+        parts.push("Momentum")
+    parts.join(" + ")
+
+// ═════════════════════════════════════════ Filters ═════════════════════════════════════════
+eventHit(int t0, int t1) =>
+    bool hit = false
+    if str.length(eventList) > 0
+        for raw in str.split(str.replace_all(eventList, "\n", ","), ",")
+            string s = str.trim(raw)
+            if str.length(s) >= 16
+                int ey = int(str.tonumber(str.substring(s, 0, 4)))
+                int em = int(str.tonumber(str.substring(s, 5, 7)))
+                int ed = int(str.tonumber(str.substring(s, 8, 10)))
+                int eh = int(str.tonumber(str.substring(s, 11, 13)))
+                int en = int(str.tonumber(str.substring(s, 14, 16)))
+                if not na(ey) and not na(em) and not na(ed) and not na(eh) and not na(en)
+                    int ts = timestamp(tz, ey, em, ed, eh, en)
+                    if t0 < ts + newsAfter * 60000 and t1 > ts - newsBefore * 60000
+                        hit := true
+    hit
+
+bool isNfpDay = dayofweek(time, tz) == dayofweek.friday and d <= 7
+int nfpTs     = timestamp(tz, y, mo, d, 8, 30)
+bool nfpHit   = autoNfp and isNfpDay and time < nfpTs + newsAfter * 60000 and time_close > nfpTs - newsBefore * 60000
+bool newsBlock = newsOn and (nfpHit or eventHit(time, time_close))
+
+float vix     = request.security(vixSym, timeframe.period, close, ignore_invalid_symbol = true)
+float vixPrev = vix[vixLook]
+float vixChg  = na(vix) or na(vixPrev) or vixPrev == 0 ? 0.0 : (vix - vixPrev) / vixPrev * 100
+bool vixBlock = vixOn and not na(vix) and (vixChg >= vixSpikePct or vix >= vixMax)
+
+float y10     = request.security(yldSym, timeframe.period, close, ignore_invalid_symbol = true)
+float yChgBp  = na(y10) or na(y10[yldLook]) ? 0.0 : (y10 - y10[yldLook]) * 100
+bool yldBlockBuy = yldOn and yChgBp >= yldJumpBp
+
+float volRatio = na(atrBase) or atrBase == 0 ? 1.0 : atr / atrBase
+bool volBlock  = volOn and volRatio >= volRatioMax
+
+bool pausedAll = newsBlock or vixBlock or volBlock
+
+// ═════════════════════════════════════════ Signals ═════════════════════════════════════════
+float longStop  = slMode == "ATR" ? close - atr * slMult : math.min(swingLo, close - atr * 0.25) - syminfo.mintick
+float shortStop = slMode == "ATR" ? close + atr * slMult : math.max(swingHi, close + atr * 0.25) + syminfo.mintick
+float riskLong  = close - longStop
+float riskShort = shortStop - close
+
+var int pos = 0
+var int lastSigBar = na
+bool cdOk = na(lastSigBar) or bar_index - lastSigBar > cooldown
+
+bool rawBuy  = buyScore  >= minScore and buyScore  > sellScore and htfBull
+bool rawSell = sellScore >= minScore and sellScore > buyScore  and htfBear
+
+bool buySig  = barstate.isconfirmed and canEnter and not mustFlat and rawBuy  and not pausedAll and not yldBlockBuy and cdOk and riskLong  > 0 and riskLong  <= maxRiskPts and (pos == 0 or (reverseOnOpp and pos == -1))
+bool sellSig = barstate.isconfirmed and canEnter and not mustFlat and rawSell and not pausedAll and cdOk and riskShort > 0 and riskShort <= maxRiskPts and (pos == 0 or (reverseOnOpp and pos == 1))
+
+// ═════════════════════════════════════════ Trade management ═════════════════════════════════════════
+var float entry   = na
+var float stopPx  = na
+var float t1      = na
+var float t2      = na
+var float t3      = na
+var float riskPts = na
+var float remain   = 0.0
+var float realized = 0.0
+var int hits     = 0
+var int entryBar = na
+
+var int nTrades = 0
+var int nWins   = 0
+var int nLoss   = 0
+var int nTp1    = 0
+var int nTp2    = 0
+var int nTp3    = 0
+var float grossW = 0.0
+var float grossL = 0.0
+var float netPts = 0.0
+var float sumR   = 0.0
+var string lastResult = "—"
+
+var line lnEntry = na
+var line lnStop  = na
+var line lnT1    = na
+var line lnT2    = na
+var line lnT3    = na
+
+bool closedNow   = false
+string exitReason = ""
+const float THIRD = 1.0 / 3.0
+
+// Each target closes one third of the position; stop is checked first on a bar (conservative).
+if barstate.isconfirmed and pos != 0 and bar_index > entryBar
+    bool stopTouched = pos == 1 ? low <= stopPx : high >= stopPx
+    if stopTouched
+        realized += remain * (stopPx - entry) * pos
+        remain := 0.0
+        closedNow := true
+        exitReason := hits == 0 ? "Stop loss" : stopPx == entry ? "Breakeven stop" : "Trailing stop"
+    else
+        if hits == 0 and (pos == 1 ? high >= t1 : low <= t1)
+            realized += THIRD * math.abs(t1 - entry)
+            remain -= THIRD
+            hits := 1
+            nTp1 += 1
+            if beAfterTp1
+                stopPx := entry
+            label.new(bar_index, t1, "TP1", style = label.style_label_left, color = color.new(C_TP, 20), textcolor = color.white, size = size.tiny)
+            alert("FlowSignal " + syminfo.ticker + " TP1 hit @ " + str.tostring(t1, format.mintick), alert.freq_once_per_bar_close)
+        if hits == 1 and (pos == 1 ? high >= t2 : low <= t2)
+            realized += THIRD * math.abs(t2 - entry)
+            remain -= THIRD
+            hits := 2
+            nTp2 += 1
+            if trailAfterTp2
+                stopPx := t1
+            label.new(bar_index, t2, "TP2", style = label.style_label_left, color = color.new(C_TP, 20), textcolor = color.white, size = size.tiny)
+            alert("FlowSignal " + syminfo.ticker + " TP2 hit @ " + str.tostring(t2, format.mintick), alert.freq_once_per_bar_close)
+        if hits == 2 and (pos == 1 ? high >= t3 : low <= t3)
+            realized += remain * math.abs(t3 - entry)
+            remain := 0.0
+            hits := 3
+            nTp3 += 1
+            closedNow := true
+            exitReason := "TP3"
+            label.new(bar_index, t3, "TP3", style = label.style_label_left, color = color.new(C_TP, 0), textcolor = color.white, size = size.tiny)
+
+if barstate.isconfirmed and pos != 0 and not closedNow and mustFlat
+    realized += remain * (close - entry) * pos
+    remain := 0.0
+    closedNow := true
+    exitReason := "Session close"
+
+if barstate.isconfirmed and pos != 0 and not closedNow and (buySig or sellSig)
+    realized += remain * (close - entry) * pos
+    remain := 0.0
+    closedNow := true
+    exitReason := "Reversed"
+
+if closedNow
+    nTrades += 1
+    netPts += realized
+    sumR += riskPts > 0 ? realized / riskPts : 0.0
+    if realized > 0
+        nWins += 1
+        grossW += realized
+    else if realized < 0
+        nLoss += 1
+        grossL -= realized
+    lastResult := (pos == 1 ? "Long " : "Short ") + exitReason + " " + (realized >= 0 ? "+" : "") + str.tostring(realized, "#.##") + " pts"
+    alert("FlowSignal " + syminfo.ticker + " exit: " + lastResult, alert.freq_once_per_bar_close)
+    pos := 0
+
+if buySig or sellSig
+    pos      := buySig ? 1 : -1
+    entry    := close
+    stopPx   := buySig ? longStop : shortStop
+    riskPts  := math.abs(entry - stopPx)
+    t1       := entry + pos * riskPts * tp1R
+    t2       := entry + pos * riskPts * tp2R
+    t3       := entry + pos * riskPts * tp3R
+    remain   := 1.0
+    realized := 0.0
+    hits     := 0
+    entryBar := bar_index
+    lastSigBar := bar_index
+
+    int score = buySig ? buyScore : sellScore
+    string srcs = buySig ? sourceNames(trendBuy, vwapBuy, orbBuy, sweepBuy, momBuy) : sourceNames(trendSell, vwapSell, orbSell, sweepSell, momSell)
+    string tip = srcs + "\nEntry " + str.tostring(entry, format.mintick) + "\nStop " + str.tostring(stopPx, format.mintick) + "\nTP1 " + str.tostring(t1, format.mintick) + "  TP2 " + str.tostring(t2, format.mintick) + "  TP3 " + str.tostring(t3, format.mintick)
+    if buySig
+        label.new(bar_index, low, "BUY\n" + str.tostring(score) + "/5", yloc = yloc.belowbar, style = label.style_label_up, color = C_BUY, textcolor = color.white, size = size.small, tooltip = tip)
+    else
+        label.new(bar_index, high, "SELL\n" + str.tostring(score) + "/5", yloc = yloc.abovebar, style = label.style_label_down, color = C_SELL, textcolor = color.white, size = size.small, tooltip = tip)
+
+    if showLevels
+        lnEntry := line.new(bar_index, entry,  bar_index + 1, entry,  color = C_DIM, style = line.style_dashed)
+        lnStop  := line.new(bar_index, stopPx, bar_index + 1, stopPx, color = C_SELL)
+        lnT1    := line.new(bar_index, t1,     bar_index + 1, t1,     color = color.new(C_TP, 40))
+        lnT2    := line.new(bar_index, t2,     bar_index + 1, t2,     color = color.new(C_TP, 20))
+        lnT3    := line.new(bar_index, t3,     bar_index + 1, t3,     color = C_TP)
+
+    string side = buySig ? "buy" : "sell"
+    alert('{"action":"' + side + '","ticker":"' + syminfo.ticker + '","entry":' + str.tostring(entry) + ',"stop":' + str.tostring(stopPx) + ',"tp1":' + str.tostring(t1) + ',"tp2":' + str.tostring(t2) + ',"tp3":' + str.tostring(t3) + ',"sources":"' + srcs + '"}', alert.freq_once_per_bar_close)
+
+// Extend the open trade's lines and keep the stop line on the current stop.
+if showLevels and not na(lnEntry) and (pos != 0 or closedNow) and bar_index > entryBar
+    lnEntry.set_x2(bar_index)
+    lnStop.set_x2(bar_index)
+    lnStop.set_y1(stopPx)
+    lnStop.set_y2(stopPx)
+    lnT1.set_x2(bar_index)
+    lnT2.set_x2(bar_index)
+    lnT3.set_x2(bar_index)
+
+// ═════════════════════════════════════════ Plots & alerts ═════════════════════════════════════════
+plot(showEmas ? emaS : na, "EMA slow",  color.new(color.orange, 30))
+plot(showEmas ? emaT : na, "EMA trend", color.new(color.purple, 30))
+plot(showVwap ? vw : na,   "VWAP",      color.new(color.yellow, 20), 2)
+plot(showOr and orReady ? orH : na, "OR high", color.new(C_BUY, 40),  style = plot.style_linebr)
+plot(showOr and orReady ? orL : na, "OR low",  color.new(C_SELL, 40), style = plot.style_linebr)
+
+bool blockedBuy  = showBlocked and barstate.isconfirmed and canEnter and rawBuy  and (pausedAll or yldBlockBuy)
+bool blockedSell = showBlocked and barstate.isconfirmed and canEnter and rawSell and pausedAll
+plotshape(blockedBuy,  "Blocked BUY",  shape.xcross, location.belowbar, C_DIM, size = size.tiny)
+plotshape(blockedSell, "Blocked SELL", shape.xcross, location.abovebar, C_DIM, size = size.tiny)
+bgcolor(pausedAll and canEnter ? color.new(color.gray, 90) : na, title = "Paused shading")
+
+alertcondition(buySig,    "FlowSignal BUY",  "FlowSignal BUY {{ticker}} @ {{close}}")
+alertcondition(sellSig,   "FlowSignal SELL", "FlowSignal SELL {{ticker}} @ {{close}}")
+alertcondition(closedNow, "FlowSignal trade closed", "FlowSignal trade closed on {{ticker}} @ {{close}}")
+
+// ═════════════════════════════════════════ Filter panel ═════════════════════════════════════════
+var table panel = table.new(position.top_right, 2, 9, bgcolor = color.new(C_BG, 10), border_color = color.new(C_DIM, 60), border_width = 1)
+cell(table t, int c, int r, string txt, color col) =>
+    t.cell(c, r, txt, text_color = col, text_size = size.small, text_halign = text.align_left)
+
+if showPanel and barstate.islast
+    string status = not canEnter ? "OUT OF SESSION" : pausedAll ? "PAUSED" : yldBlockBuy ? "SELLS ONLY" : "ACTIVE"
+    color statusCol = status == "ACTIVE" ? C_BUY : status == "PAUSED" ? C_SELL : color.orange
+    int nSources = (useTrend ? 1 : 0) + (useVwap ? 1 : 0) + (useOrb ? 1 : 0) + (useSweep ? 1 : 0) + (useMom ? 1 : 0)
+    cell(panel, 0, 0, "FlowSignal", C_TXT)
+    cell(panel, 1, 0, status, statusCol)
+    cell(panel, 0, 1, "News", C_DIM)
+    cell(panel, 1, 1, not newsOn ? "off" : newsBlock ? (nfpHit ? "PAUSED · jobs report" : "PAUSED · scheduled event") : "clear", newsBlock ? C_SELL : C_TXT)
+    cell(panel, 0, 2, "VIX", C_DIM)
+    cell(panel, 1, 2, na(vix) ? "n/a" : str.tostring(vix, "#.##") + " (" + (vixChg >= 0 ? "+" : "") + str.tostring(vixChg, "#.#") + "%)" + (vixBlock ? " · SPIKE" : ""), vixBlock ? C_SELL : C_TXT)
+    cell(panel, 0, 3, "US10Y", C_DIM)
+    cell(panel, 1, 3, na(y10) ? "n/a" : str.tostring(y10, "#.###") + "% (" + (yChgBp >= 0 ? "+" : "") + str.tostring(yChgBp, "#.#") + " bp)" + (yldBlockBuy ? " · BUYs blocked" : ""), yldBlockBuy ? color.orange : C_TXT)
+    cell(panel, 0, 4, "Volatility", C_DIM)
+    cell(panel, 1, 4, str.tostring(volRatio, "#.##") + "x avg ATR" + (volBlock ? " · EXTREME" : ""), volBlock ? C_SELL : C_TXT)
+    cell(panel, 0, 5, "HTF bias", C_DIM)
+    cell(panel, 1, 5, not useHtf ? "off" : htfC > htfE ? "Bullish (" + htfTf + ")" : "Bearish (" + htfTf + ")", not useHtf ? C_DIM : htfC > htfE ? C_BUY : C_SELL)
+    cell(panel, 0, 6, "Sources", C_DIM)
+    cell(panel, 1, 6, str.tostring(nSources) + "/5 on · need " + str.tostring(minScore), C_TXT)
+    cell(panel, 0, 7, "Position", C_DIM)
+    cell(panel, 1, 7, pos == 0 ? "Flat" : (pos == 1 ? "Long " : "Short ") + str.tostring(entry, format.mintick) + " · stop " + str.tostring(stopPx, format.mintick), pos == 1 ? C_BUY : pos == -1 ? C_SELL : C_TXT)
+    cell(panel, 0, 8, "Last", C_DIM)
+    cell(panel, 1, 8, lastResult, C_TXT)
+
+// ═════════════════════════════════════════ Stats box ═════════════════════════════════════════
+var table stats = table.new(position.bottom_right, 2, 8, bgcolor = color.new(C_BG, 10), border_color = color.new(C_DIM, 60), border_width = 1)
+if showStats and barstate.islast
+    float winRate = nTrades > 0 ? float(nWins) / nTrades * 100 : 0.0
+    string pf = grossL > 0 ? str.tostring(grossW / grossL, "#.##") : grossW > 0 ? "∞" : "—"
+    float avgR = nTrades > 0 ? sumR / nTrades : 0.0
+    cell(stats, 0, 0, "Stats (1 contract)", C_TXT)
+    cell(stats, 1, 0, syminfo.ticker, C_DIM)
+    cell(stats, 0, 1, "Trades", C_DIM)
+    cell(stats, 1, 1, str.tostring(nTrades) + "  (" + str.tostring(nWins) + "W / " + str.tostring(nLoss) + "L / " + str.tostring(nTrades - nWins - nLoss) + " BE)", C_TXT)
+    cell(stats, 0, 2, "Win rate", C_DIM)
+    cell(stats, 1, 2, str.tostring(winRate, "#.#") + "%", winRate >= 50 ? C_BUY : C_SELL)
+    cell(stats, 0, 3, "Net points", C_DIM)
+    cell(stats, 1, 3, str.tostring(netPts, "#.##"), netPts >= 0 ? C_BUY : C_SELL)
+    cell(stats, 0, 4, "Net $", C_DIM)
+    cell(stats, 1, 4, "$" + str.tostring(netPts * syminfo.pointvalue, "#,###.##"), netPts >= 0 ? C_BUY : C_SELL)
+    cell(stats, 0, 5, "Profit factor", C_DIM)
+    cell(stats, 1, 5, pf, C_TXT)
+    cell(stats, 0, 6, "Avg R / trade", C_DIM)
+    cell(stats, 1, 6, str.tostring(avgR, "#.##") + "R", avgR >= 0 ? C_BUY : C_SELL)
+    cell(stats, 0, 7, "TP1 / TP2 / TP3 hits", C_DIM)
+    cell(stats, 1, 7, str.tostring(nTp1) + " / " + str.tostring(nTp2) + " / " + str.tostring(nTp3), C_TXT)
